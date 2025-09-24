@@ -73,7 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Spin up a temporary KinD cluster for integration testing
+      # Start KinD with a predictable cluster name
       - name: Start KinD
         uses: helm/kind-action@v1
         with:
@@ -82,15 +82,23 @@ jobs:
 
       - name: Show cluster
         run: |
-          echo "== Client and Server Versions =="
+          echo "== Clusters =="
           kind get clusters
+          echo "== Current context =="
+          kubectl config current-context || true
+          echo "== Client/Server Versions (YAML) =="
           kubectl version --output=yaml
-          echo "== Cluster Info =="
-          kubectl cluster-info
           echo "== Nodes =="
           kubectl get nodes -o wide
 
-      # Load the just-built image into KinD (avoids pulling from GHCR)
+      # Create all namespaces dynamically so multi-namespace YAMLs apply cleanly
+      - name: Create namespaces (dev/staging/prod)
+        run: |
+          kubectl create ns demo-dev --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create ns demo-staging --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create ns demo-prod --dry-run=client -o yaml | kubectl apply -f -
+
+      # Pull the built image from GHCR, retag locally, and load into KinD
       - name: Pull and load image into KinD
         env:
           IMAGE: ghcr.io/${{ github.repository }}
@@ -99,32 +107,44 @@ jobs:
           echo "${{ github.token }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
           docker pull $IMAGE:$TAG
           docker tag $IMAGE:$TAG hello-k8s:test
-          kind load docker-image hello-k8s:test
+          kind load docker-image hello-k8s:test --name kind
 
-      # Apply base manifests for dev namespace
+      # Apply your k8s manifests (these may include all envs; that's OK)
       - name: Apply base manifests
         run: |
-          kubectl apply -f k8s/ns-dev.yaml
           kubectl apply -f k8s/configmap.yaml
           kubectl apply -f k8s/pvc.yaml
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/deployment.yaml
 
-      # Point deployment to the locally loaded image and verify rollout
+      # Point dev deployment to the local image and wait for readiness
       - name: Rollout to demo-dev
         run: |
           kubectl -n demo-dev set image deploy/hello hello=hello-k8s:test
           kubectl -n demo-dev rollout status deploy/hello --timeout=5m
+          kubectl -n demo-dev get pods,svc
 
-      # Quick smoke test (health + homepage)
+      # Smoke test via port-forward + curl
       - name: Smoke test
         run: |
           kubectl -n demo-dev port-forward svc/hello 8080:80 >/tmp/pf.log 2>&1 &
           sleep 2
+          echo "== /healthz =="
           curl -sSf http://127.0.0.1:8080/healthz | tee /tmp/healthz.json
+          echo "== / =="
           curl -sSf http://127.0.0.1:8080/ | head -n1
 
-  # ----------------- EKS deploys (optional; skip cleanly without secrets) -----------------
+      # Optional: helpful debug on failure
+      - name: Debug pods on failure
+        if: failure()
+        run: |
+          kubectl -n demo-dev get pods -o wide
+          kubectl -n demo-dev describe deploy/hello || true
+          kubectl -n demo-dev describe pods || true
+          kubectl -n demo-dev logs deploy/hello --all-containers=true --tail=200 || true
+          kubectl -n demo-dev get events --sort-by=.lastTimestamp | tail -n 100 || true
+
+  # ----------------- Optional EKS deploys (skip cleanly without secrets) -----------------
   deploy-dev:
     name: Deploy to EKS dev (skips if no secret)
     needs: [build]
