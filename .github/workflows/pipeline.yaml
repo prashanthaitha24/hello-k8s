@@ -1,19 +1,19 @@
-name: build-and-deploy
+name: build-test-integration
 
 on:
   push:
     branches: [ develop, main ]
-    tags: [ 'v*.*.*' ]   # prod releases by tag, e.g., v1.2.3
+    tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ develop, main ]
 
 permissions:
   contents: read
   packages: write
-  id-token: write    # for future OIDC/assume-role if needed
+  id-token: write
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}   # ghcr.io/<you>/hello-k8s
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   test:
@@ -21,23 +21,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
       - name: Install deps
         run: |
           python -m pip install -U pip
           pip install -r requirements.txt -r requirements-dev.txt
-
       - name: Run tests
-        run: |
-          pytest --cov=. --cov-report=term-missing
+        run: pytest --cov=. --cov-report=term-missing
 
   build:
-    name: Build & Push Image
+    name: Build & Push (GHCR)
     needs: [test]
     runs-on: ubuntu-latest
     outputs:
@@ -49,7 +45,7 @@ jobs:
         id: meta
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            echo "image_tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT     # vX.Y.Z
+            echo "image_tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
           else
             echo "image_tag=sha-${GITHUB_SHA}" >> $GITHUB_OUTPUT
           fi
@@ -67,12 +63,65 @@ jobs:
           docker push $IMAGE:${{ steps.meta.outputs.image_tag }}
           docker push $IMAGE:latest
 
-  deploy-dev:
-    name: Deploy to dev (demo-dev)
+  # ---- Integration test in a temporary KinD cluster (no AWS required) ----
+  integration-kind:
+    name: Integration on KinD (no AWS)
     needs: [build]
-    if: |
-      (github.event_name == 'pull_request' && github.base_ref == 'develop') ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Create a KinD cluster
+      - name: Start KinD
+        uses: helm/kind-action@v1
+        with:
+          version: v0.23.0
+
+      - name: Show cluster
+        run: |
+          kubectl version --short
+          kubectl cluster-info
+          kubectl get nodes
+
+      # Re-tag the built image to a simple local name and load it into KinD
+      - name: Prepare image for KinD
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          docker tag $IMAGE:$TAG hello-k8s:test
+          kind load docker-image hello-k8s:test
+
+      # Create namespaces + config + storage
+      - name: Apply base manifests
+        run: |
+          kubectl apply -f k8s/ns-dev.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/pvc.yaml
+          kubectl apply -f k8s/service.yaml
+          # apply deployment with placeholder image first
+          kubectl apply -f k8s/deployment.yaml
+
+      # Point the deployment to the locally loaded image, then wait
+      - name: Rollout to demo-dev
+        run: |
+          kubectl -n demo-dev set image deploy/hello hello=hello-k8s:test
+          kubectl -n demo-dev rollout status deploy/hello --timeout=5m
+
+      # Smoke test via port-forward + curl
+      - name: Smoke test
+        run: |
+          kubectl -n demo-dev get pods,svc
+          kubectl -n demo-dev port-forward svc/hello 8080:80 >/tmp/pf.log 2>&1 &
+          sleep 2
+          curl -sSf http://127.0.0.1:8080/healthz | tee /tmp/healthz.json
+          curl -sSf http://127.0.0.1:8080/ | head -n1
+
+  # ---- EKS deploy jobs (auto-skip until you add kubeconfigs or OIDC) ----
+  deploy-dev:
+    name: Deploy to EKS dev (skips w/o secret)
+    needs: [build]
+    if: ${{ secrets.KUBECONFIG_DEV != '' }}
     runs-on: ubuntu-latest
     environment: dev
     steps:
@@ -82,6 +131,7 @@ jobs:
         run: |
           mkdir -p ~/.kube
           printf "%s" "${KUBECONFIG_DEV}" > ~/.kube/config
+          kubectl cluster-info
         env:
           KUBECONFIG_DEV: ${{ secrets.KUBECONFIG_DEV }}
       - name: Rollout
@@ -93,9 +143,9 @@ jobs:
           kubectl -n demo-dev rollout status deploy/hello --timeout=5m
 
   deploy-staging:
-    name: Deploy to staging (demo-staging)
+    name: Deploy to EKS staging (skips w/o secret)
     needs: [build]
-    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')
+    if: ${{ secrets.KUBECONFIG_STAGING != '' }}
     runs-on: ubuntu-latest
     environment: staging
     steps:
@@ -105,6 +155,7 @@ jobs:
         run: |
           mkdir -p ~/.kube
           printf "%s" "${KUBECONFIG_STAGING}" > ~/.kube/config
+          kubectl cluster-info
         env:
           KUBECONFIG_STAGING: ${{ secrets.KUBECONFIG_STAGING }}
       - name: Rollout
@@ -116,9 +167,9 @@ jobs:
           kubectl -n demo-staging rollout status deploy/hello --timeout=5m
 
   deploy-prod:
-    name: Deploy to prod (demo-prod)
+    name: Deploy to EKS prod (skips w/o secret)
     needs: [build]
-    if: github.ref_type == 'tag'    # only when pushing a vX.Y.Z tag
+    if: ${{ github.ref_type == 'tag' && secrets.KUBECONFIG_PROD != '' }}
     runs-on: ubuntu-latest
     environment: prod
     steps:
@@ -128,6 +179,7 @@ jobs:
         run: |
           mkdir -p ~/.kube
           printf "%s" "${KUBECONFIG_PROD}" > ~/.kube/config
+          kubectl cluster-info
         env:
           KUBECONFIG_PROD: ${{ secrets.KUBECONFIG_PROD }}
       - name: Rollout
