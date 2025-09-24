@@ -3,7 +3,7 @@ name: build-test-integration
 on:
   push:
     branches: [ develop, main ]
-    tags: [ 'v*.*.*' ]
+    tags: [ 'v*.*.*' ]     # prod releases (e.g., v1.2.3)
   pull_request:
     branches: [ develop, main ]
 
@@ -21,14 +21,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+
       - name: Install deps
         run: |
           python -m pip install -U pip
           pip install -r requirements.txt -r requirements-dev.txt
+
       - name: Run tests
         run: pytest --cov=. --cov-report=term-missing
 
@@ -63,7 +66,6 @@ jobs:
           docker push $IMAGE:${{ steps.meta.outputs.image_tag }}
           docker push $IMAGE:latest
 
-  # ---- Integration test in a temporary KinD cluster (no AWS required) ----
   integration-kind:
     name: Integration on KinD (no AWS)
     needs: [build]
@@ -71,7 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Create a KinD cluster
+      # Spin up a temporary KinD cluster for integration testing
       - name: Start KinD
         uses: helm/kind-action@v1
         with:
@@ -83,8 +85,8 @@ jobs:
           kubectl cluster-info
           kubectl get nodes
 
-      # Re-tag the built image to a simple local name and load it into KinD
-      - name: Prepare image for KinD
+      # Load the just-built image into KinD (avoids pulling from GHCR)
+      - name: Load image into KinD
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           TAG: ${{ needs.build.outputs.image_tag }}
@@ -92,49 +94,64 @@ jobs:
           docker tag $IMAGE:$TAG hello-k8s:test
           kind load docker-image hello-k8s:test
 
-      # Create namespaces + config + storage
+      # Apply base manifests for dev namespace
       - name: Apply base manifests
         run: |
           kubectl apply -f k8s/ns-dev.yaml
           kubectl apply -f k8s/configmap.yaml
           kubectl apply -f k8s/pvc.yaml
           kubectl apply -f k8s/service.yaml
-          # apply deployment with placeholder image first
           kubectl apply -f k8s/deployment.yaml
 
-      # Point the deployment to the locally loaded image, then wait
+      # Point deployment to the locally loaded image and verify rollout
       - name: Rollout to demo-dev
         run: |
           kubectl -n demo-dev set image deploy/hello hello=hello-k8s:test
           kubectl -n demo-dev rollout status deploy/hello --timeout=5m
 
-      # Smoke test via port-forward + curl
+      # Quick smoke test (health + homepage)
       - name: Smoke test
         run: |
-          kubectl -n demo-dev get pods,svc
           kubectl -n demo-dev port-forward svc/hello 8080:80 >/tmp/pf.log 2>&1 &
           sleep 2
           curl -sSf http://127.0.0.1:8080/healthz | tee /tmp/healthz.json
           curl -sSf http://127.0.0.1:8080/ | head -n1
 
-  # ---- EKS deploy jobs (auto-skip until you add kubeconfigs or OIDC) ----
+  # ----------------- EKS deploys (optional; skip cleanly without secrets) -----------------
   deploy-dev:
-    name: Deploy to EKS dev (skips w/o secret)
+    name: Deploy to EKS dev (skips if no secret)
     needs: [build]
-    if: ${{ secrets.KUBECONFIG_DEV != '' }}
     runs-on: ubuntu-latest
     environment: dev
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-kubectl@v4
-      - name: Write kubeconfig from secret
-        run: |
-          mkdir -p ~/.kube
-          printf "%s" "${KUBECONFIG_DEV}" > ~/.kube/config
-          kubectl cluster-info
+
+      - name: Check for kubeconfig secret
+        shell: bash
         env:
           KUBECONFIG_DEV: ${{ secrets.KUBECONFIG_DEV }}
+        run: |
+          if [[ -z "$KUBECONFIG_DEV" ]]; then
+            echo "No KUBECONFIG_DEV secret found. Skipping EKS dev deploy."
+            echo "SKIP_DEPLOY=true" >> $GITHUB_ENV
+          else
+            echo "SKIP_DEPLOY=false" >> $GITHUB_ENV
+          fi
+
+      - uses: azure/setup-kubectl@v4
+        if: env.SKIP_DEPLOY == 'false'
+
+      - name: Write kubeconfig
+        if: env.SKIP_DEPLOY == 'false'
+        env:
+          KUBECONFIG_DEV: ${{ secrets.KUBECONFIG_DEV }}
+        run: |
+          mkdir -p ~/.kube
+          printf "%s" "$KUBECONFIG_DEV" > ~/.kube/config
+          kubectl cluster-info
+
       - name: Rollout
+        if: env.SKIP_DEPLOY == 'false'
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           TAG: ${{ needs.build.outputs.image_tag }}
@@ -143,22 +160,39 @@ jobs:
           kubectl -n demo-dev rollout status deploy/hello --timeout=5m
 
   deploy-staging:
-    name: Deploy to EKS staging (skips w/o secret)
+    name: Deploy to EKS staging (skips if no secret)
     needs: [build]
-    if: ${{ secrets.KUBECONFIG_STAGING != '' }}
     runs-on: ubuntu-latest
     environment: staging
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-kubectl@v4
-      - name: Write kubeconfig from secret
-        run: |
-          mkdir -p ~/.kube
-          printf "%s" "${KUBECONFIG_STAGING}" > ~/.kube/config
-          kubectl cluster-info
+
+      - name: Check for kubeconfig secret
+        shell: bash
         env:
           KUBECONFIG_STAGING: ${{ secrets.KUBECONFIG_STAGING }}
+        run: |
+          if [[ -z "$KUBECONFIG_STAGING" ]]; then
+            echo "No KUBECONFIG_STAGING secret found. Skipping EKS staging deploy."
+            echo "SKIP_DEPLOY=true" >> $GITHUB_ENV
+          else
+            echo "SKIP_DEPLOY=false" >> $GITHUB_ENV
+          fi
+
+      - uses: azure/setup-kubectl@v4
+        if: env.SKIP_DEPLOY == 'false'
+
+      - name: Write kubeconfig
+        if: env.SKIP_DEPLOY == 'false'
+        env:
+          KUBECONFIG_STAGING: ${{ secrets.KUBECONFIG_STAGING }}
+        run: |
+          mkdir -p ~/.kube
+          printf "%s" "$KUBECONFIG_STAGING" > ~/.kube/config
+          kubectl cluster-info
+
       - name: Rollout
+        if: env.SKIP_DEPLOY == 'false'
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           TAG: ${{ needs.build.outputs.image_tag }}
@@ -167,22 +201,46 @@ jobs:
           kubectl -n demo-staging rollout status deploy/hello --timeout=5m
 
   deploy-prod:
-    name: Deploy to EKS prod (skips w/o secret)
+    name: Deploy to EKS prod (tags only; skips if no secret)
     needs: [build]
-    if: ${{ github.ref_type == 'tag' && secrets.KUBECONFIG_PROD != '' }}
     runs-on: ubuntu-latest
     environment: prod
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-kubectl@v4
-      - name: Write kubeconfig from secret
+
+      - name: Enforce tag builds only
+        if: ${{ github.ref_type != 'tag' }}
         run: |
-          mkdir -p ~/.kube
-          printf "%s" "${KUBECONFIG_PROD}" > ~/.kube/config
-          kubectl cluster-info
+          echo "Not a tag build (ref_type=${{ github.ref_type }}). Skipping prod deploy."
+          echo "SKIP_DEPLOY=true" >> $GITHUB_ENV
+
+      - name: Check for kubeconfig secret
+        if: env.SKIP_DEPLOY != 'true'
+        shell: bash
         env:
           KUBECONFIG_PROD: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          if [[ -z "$KUBECONFIG_PROD" ]]; then
+            echo "No KUBECONFIG_PROD secret found. Skipping EKS prod deploy."
+            echo "SKIP_DEPLOY=true" >> $GITHUB_ENV
+          else
+            echo "SKIP_DEPLOY=false" >> $GITHUB_ENV
+          fi
+
+      - uses: azure/setup-kubectl@v4
+        if: env.SKIP_DEPLOY == 'false'
+
+      - name: Write kubeconfig
+        if: env.SKIP_DEPLOY == 'false'
+        env:
+          KUBECONFIG_PROD: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          mkdir -p ~/.kube
+          printf "%s" "$KUBECONFIG_PROD" > ~/.kube/config
+          kubectl cluster-info
+
       - name: Rollout
+        if: env.SKIP_DEPLOY == 'false'
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           TAG: ${{ needs.build.outputs.image_tag }}
