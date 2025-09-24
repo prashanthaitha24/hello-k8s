@@ -89,11 +89,13 @@ jobs:
           kubectl get nodes -o wide
 
       # Load the just-built image into KinD (avoids pulling from GHCR)
-      - name: Load image into KinD
+      - name: Pull and load image into KinD
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           TAG: ${{ needs.build.outputs.image_tag }}
         run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+          docker pull $IMAGE:$TAG
           docker tag $IMAGE:$TAG hello-k8s:test
           kind load docker-image hello-k8s:test
 
