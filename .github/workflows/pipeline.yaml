@@ -3,20 +3,42 @@ name: build-and-deploy
 on:
   push:
     branches: [ develop, main ]
-    tags: [ 'v*.*.*' ]
+    tags: [ 'v*.*.*' ]   # prod releases by tag, e.g., v1.2.3
   pull_request:
     branches: [ develop, main ]
 
 permissions:
   contents: read
   packages: write
-  id-token: write 
+  id-token: write    # for future OIDC/assume-role if needed
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  IMAGE: ghcr.io/${{ github.repository }}   # ghcr.io/<you>/hello-k8s
 
 jobs:
+  test:
+    name: Pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: |
+          pytest --cov=. --cov-report=term-missing
+
   build:
+    name: Build & Push Image
+    needs: [test]
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
@@ -32,20 +54,21 @@ jobs:
             echo "image_tag=sha-${GITHUB_SHA}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build
+      - name: Docker build
         run: |
           docker build -t $IMAGE:${{ steps.meta.outputs.image_tag }} .
           docker tag  $IMAGE:${{ steps.meta.outputs.image_tag }} $IMAGE:latest
 
-      - name: Login GHCR
+      - name: Login to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
 
-      - name: Push
+      - name: Push images
         run: |
           docker push $IMAGE:${{ steps.meta.outputs.image_tag }}
           docker push $IMAGE:latest
 
   deploy-dev:
+    name: Deploy to dev (demo-dev)
     needs: [build]
     if: |
       (github.event_name == 'pull_request' && github.base_ref == 'develop') ||
@@ -55,58 +78,62 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-kubectl@v4
-      - name: Kubeconfig (provided via secret or runner)
+      - name: Write kubeconfig from secret
         run: |
           mkdir -p ~/.kube
-          echo "${KUBECONFIG_DEV}" > ~/.kube/config
+          printf "%s" "${KUBECONFIG_DEV}" > ~/.kube/config
         env:
           KUBECONFIG_DEV: ${{ secrets.KUBECONFIG_DEV }}
-      - name: Deploy to demo-dev
-        run: |
-          kubectl -n demo-dev set image deploy/hello hello=$IMAGE:${{ needs.build.outputs.image_tag }}
-          kubectl -n demo-dev rollout status deploy/hello --timeout=3m
+      - name: Rollout
         env:
           IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          kubectl -n demo-dev set image deploy/hello hello=$IMAGE:$TAG
+          kubectl -n demo-dev rollout status deploy/hello --timeout=5m
 
   deploy-staging:
+    name: Deploy to staging (demo-staging)
     needs: [build]
-    if: |
-      github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')
     runs-on: ubuntu-latest
     environment: staging
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-kubectl@v4
-      - name: Kubeconfig
+      - name: Write kubeconfig from secret
         run: |
           mkdir -p ~/.kube
-          echo "${KUBECONFIG_STAGING}" > ~/.kube/config
+          printf "%s" "${KUBECONFIG_STAGING}" > ~/.kube/config
         env:
           KUBECONFIG_STAGING: ${{ secrets.KUBECONFIG_STAGING }}
-      - name: Deploy to demo-staging
-        run: |
-          kubectl -n demo-staging set image deploy/hello hello=$IMAGE:${{ needs.build.outputs.image_tag }}
-          kubectl -n demo-staging rollout status deploy/hello --timeout=5m
+      - name: Rollout
         env:
           IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          kubectl -n demo-staging set image deploy/hello hello=$IMAGE:$TAG
+          kubectl -n demo-staging rollout status deploy/hello --timeout=5m
 
   deploy-prod:
+    name: Deploy to prod (demo-prod)
     needs: [build]
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag'    # only when pushing a vX.Y.Z tag
     runs-on: ubuntu-latest
-    environment: prod   # requires approval before steps run
+    environment: prod
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-kubectl@v4
-      - name: Kubeconfig
+      - name: Write kubeconfig from secret
         run: |
           mkdir -p ~/.kube
-          echo "${KUBECONFIG_PROD}" > ~/.kube/config
+          printf "%s" "${KUBECONFIG_PROD}" > ~/.kube/config
         env:
           KUBECONFIG_PROD: ${{ secrets.KUBECONFIG_PROD }}
-      - name: Deploy to demo-prod
-        run: |
-          kubectl -n demo-prod set image deploy/hello hello=$IMAGE:${{ needs.build.outputs.image_tag }}
-          kubectl -n demo-prod rollout status deploy/hello --timeout=5m
+      - name: Rollout
         env:
           IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          kubectl -n demo-prod set image deploy/hello hello=$IMAGE:$TAG
+          kubectl -n demo-prod rollout status deploy/hello --timeout=5m
