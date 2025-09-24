@@ -81,9 +81,12 @@ jobs:
 
       - name: Show cluster
         run: |
-          kubectl version --short
+          echo "== Client and Server Versions =="
+          kubectl version --output=yaml
+          echo "== Cluster Info =="
           kubectl cluster-info
-          kubectl get nodes
+          echo "== Nodes =="
+          kubectl get nodes -o wide
 
       # Load the just-built image into KinD (avoids pulling from GHCR)
       - name: Load image into KinD
