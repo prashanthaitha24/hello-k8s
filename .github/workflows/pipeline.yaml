@@ -1,0 +1,276 @@
+name: build-test-integration
+
+on:
+  push:
+    branches: [ develop, main ]
+    tags: [ 'v*.*.*' ]     # prod releases (e.g., v1.2.3)
+  pull_request:
+    branches: [ develop, main ]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    name: Pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest --cov=. --cov-report=term-missing
+
+  build:
+    name: Build & Push (GHCR)
+    needs: [test]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide image tag
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "image_tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "image_tag=sha-${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker build
+        run: |
+          docker build -t $IMAGE:${{ steps.meta.outputs.image_tag }} .
+          docker tag  $IMAGE:${{ steps.meta.outputs.image_tag }} $IMAGE:latest
+
+      - name: Login to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+
+      - name: Push images
+        run: |
+          docker push $IMAGE:${{ steps.meta.outputs.image_tag }}
+          docker push $IMAGE:latest
+
+  integration-kind:
+    name: Integration on KinD (no AWS)
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start KinD with a predictable cluster name
+      - name: Start KinD
+        uses: helm/kind-action@v1
+        with:
+          version: v0.23.0
+          cluster_name: kind
+
+      - name: Show cluster
+        run: |
+          echo "== Clusters =="
+          kind get clusters
+          echo "== Current context =="
+          kubectl config current-context || true
+          echo "== Client/Server Versions (YAML) =="
+          kubectl version --output=yaml
+          echo "== Nodes =="
+          kubectl get nodes -o wide
+
+      # Create all namespaces dynamically so multi-namespace YAMLs apply cleanly
+      - name: Create namespaces (dev/staging/prod)
+        run: |
+          kubectl create ns demo-dev --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create ns demo-staging --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create ns demo-prod --dry-run=client -o yaml | kubectl apply -f -
+
+      # Pull the built image from GHCR, retag locally, and load into KinD
+      - name: Pull and load image into KinD
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+          docker pull $IMAGE:$TAG
+          docker tag $IMAGE:$TAG hello-k8s:test
+          kind load docker-image hello-k8s:test --name kind
+
+      # Apply your k8s manifests (these may include all envs; that's OK)
+      - name: Apply base manifests
+        run: |
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/pvc.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/deployment.yaml
+
+      # Point dev deployment to the local image and wait for readiness
+      - name: Rollout to demo-dev
+        run: |
+          kubectl -n demo-dev set image deploy/hello hello=hello-k8s:test
+          kubectl -n demo-dev rollout status deploy/hello --timeout=5m
+          kubectl -n demo-dev get pods,svc
+
+      # Smoke test via port-forward + curl
+      - name: Smoke test
+        run: |
+          kubectl -n demo-dev port-forward svc/hello 8080:80 >/tmp/pf.log 2>&1 &
+          sleep 2
+          echo "== /healthz =="
+          curl -sSf http://127.0.0.1:8080/healthz | tee /tmp/healthz.json
+          echo "== / =="
+          curl -sSf http://127.0.0.1:8080/ | head -n1
+
+      # Optional: helpful debug on failure
+      - name: Debug pods on failure
+        if: failure()
+        run: |
+          kubectl -n demo-dev get pods -o wide
+          kubectl -n demo-dev describe deploy/hello || true
+          kubectl -n demo-dev describe pods || true
+          kubectl -n demo-dev logs deploy/hello --all-containers=true --tail=200 || true
+          kubectl -n demo-dev get events --sort-by=.lastTimestamp | tail -n 100 || true
+
+  # ----------------- Optional EKS deploys (skip cleanly without secrets) -----------------
+  deploy-dev:
+    name: Deploy to EKS dev (skips if no secret)
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for kubeconfig secret
+        shell: bash
+        env:
+          KUBECONFIG_DEV: ${{ secrets.KUBECONFIG_DEV }}
+        run: |
+          if [[ -z "$KUBECONFIG_DEV" ]]; then
+            echo "No KUBECONFIG_DEV secret found. Skipping EKS dev deploy."
+            echo "SKIP_DEPLOY=true" >> $GITHUB_ENV
+          else
+            echo "SKIP_DEPLOY=false" >> $GITHUB_ENV
+          fi
+
+      - uses: azure/setup-kubectl@v4
+        if: env.SKIP_DEPLOY == 'false'
+
+      - name: Write kubeconfig
+        if: env.SKIP_DEPLOY == 'false'
+        env:
+          KUBECONFIG_DEV: ${{ secrets.KUBECONFIG_DEV }}
+        run: |
+          mkdir -p ~/.kube
+          printf "%s" "$KUBECONFIG_DEV" > ~/.kube/config
+          kubectl cluster-info
+
+      - name: Rollout
+        if: env.SKIP_DEPLOY == 'false'
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          kubectl -n demo-dev set image deploy/hello hello=$IMAGE:$TAG
+          kubectl -n demo-dev rollout status deploy/hello --timeout=5m
+
+  deploy-staging:
+    name: Deploy to EKS staging (skips if no secret)
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for kubeconfig secret
+        shell: bash
+        env:
+          KUBECONFIG_STAGING: ${{ secrets.KUBECONFIG_STAGING }}
+        run: |
+          if [[ -z "$KUBECONFIG_STAGING" ]]; then
+            echo "No KUBECONFIG_STAGING secret found. Skipping EKS staging deploy."
+            echo "SKIP_DEPLOY=true" >> $GITHUB_ENV
+          else
+            echo "SKIP_DEPLOY=false" >> $GITHUB_ENV
+          fi
+
+      - uses: azure/setup-kubectl@v4
+        if: env.SKIP_DEPLOY == 'false'
+
+      - name: Write kubeconfig
+        if: env.SKIP_DEPLOY == 'false'
+        env:
+          KUBECONFIG_STAGING: ${{ secrets.KUBECONFIG_STAGING }}
+        run: |
+          mkdir -p ~/.kube
+          printf "%s" "$KUBECONFIG_STAGING" > ~/.kube/config
+          kubectl cluster-info
+
+      - name: Rollout
+        if: env.SKIP_DEPLOY == 'false'
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          kubectl -n demo-staging set image deploy/hello hello=$IMAGE:$TAG
+          kubectl -n demo-staging rollout status deploy/hello --timeout=5m
+
+  deploy-prod:
+    name: Deploy to EKS prod (tags only; skips if no secret)
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enforce tag builds only
+        if: ${{ github.ref_type != 'tag' }}
+        run: |
+          echo "Not a tag build (ref_type=${{ github.ref_type }}). Skipping prod deploy."
+          echo "SKIP_DEPLOY=true" >> $GITHUB_ENV
+
+      - name: Check for kubeconfig secret
+        if: env.SKIP_DEPLOY != 'true'
+        shell: bash
+        env:
+          KUBECONFIG_PROD: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          if [[ -z "$KUBECONFIG_PROD" ]]; then
+            echo "No KUBECONFIG_PROD secret found. Skipping EKS prod deploy."
+            echo "SKIP_DEPLOY=true" >> $GITHUB_ENV
+          else
+            echo "SKIP_DEPLOY=false" >> $GITHUB_ENV
+          fi
+
+      - uses: azure/setup-kubectl@v4
+        if: env.SKIP_DEPLOY == 'false'
+
+      - name: Write kubeconfig
+        if: env.SKIP_DEPLOY == 'false'
+        env:
+          KUBECONFIG_PROD: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          mkdir -p ~/.kube
+          printf "%s" "$KUBECONFIG_PROD" > ~/.kube/config
+          kubectl cluster-info
+
+      - name: Rollout
+        if: env.SKIP_DEPLOY == 'false'
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          kubectl -n demo-prod set image deploy/hello hello=$IMAGE:$TAG
+          kubectl -n demo-prod rollout status deploy/hello --timeout=5m
