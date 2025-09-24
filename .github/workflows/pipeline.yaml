@@ -78,10 +78,12 @@ jobs:
         uses: helm/kind-action@v1
         with:
           version: v0.23.0
+          cluster_name: kind
 
       - name: Show cluster
         run: |
           echo "== Client and Server Versions =="
+          kind get clusters
           kubectl version --output=yaml
           echo "== Cluster Info =="
           kubectl cluster-info
